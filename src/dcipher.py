@@ -1,24 +1,40 @@
 import nltk
 import re
 import wordsegment
+import math
 
 import numpy as np
 
-from src.test import probablyties
+from src.test import probablyties_ru, probablyties_en
 
 from collections import Counter
 from functools import reduce
 from typing import List, Dict, Optional, Tuple
-from langdetect import detect
 
 class Decipher():
     def __init__(self) -> None:
         self.key = None
-        self.first_char = ord('А')
-        self.last_char = ord('Я')
-        self.probablyties = probablyties
-        self.alphabet_chars = np.arange(self.first_char, self.last_char + 1, 1)
-        self.crypt_matrix = self._get_crypt_matrix()
+        self.current_lang = None
+        self.avilable_lang = [
+            "en",
+            "ru"
+        ]
+        self.first_char = {
+            "ru": ord('А'),
+            "en": ord('A')
+        }
+        self.last_char = {
+            "ru": ord('Я'),
+            "en": ord('Z')
+        }
+        self.probablyties = {
+            "ru": probablyties_ru,
+            "en": probablyties_en
+        }
+        self.alphabet_chars = dict([
+            (langs, np.arange(self.first_char[langs], self.last_char[langs] + 1, 1))
+            for langs in self.avilable_lang
+        ])
 
     def _get_factor_of_int(self, number: int) -> List[int]:
         return [num for num in range(2, number + 1) if number % num == 0]
@@ -30,24 +46,17 @@ class Decipher():
             (key, count / total)
             for key, count in counter.items()
         ])
-    
-    def _get_crypt_matrix(self) -> np.ndarray:
-        matrix = []
-        matrix_alphabet = self.alphabet_chars.copy()
-        for _ in self.alphabet_chars:
-            matrix.append(matrix_alphabet.tolist())
-            matrix_alphabet = np.roll(matrix_alphabet, -1)
-        return np.array(matrix)
 
     def _get_prob_difference(self, sample: List[str]) -> float:
         sample_prob = self._get_prob_dist(sample)
         res = 0
         for k, v in sample_prob.items():
-            res += (self.probablyties[k] - v)**2
+            res += (self.probablyties[self.current_lang][k] - v)**2
         return res
 
     def _preprocess(self, text: str) -> str:
         text = text.upper()
+        text = text.replace("Ё", "Е")
         regex = re.compile('[^A-ZА-Я]')
         return regex.sub('', text)
 
@@ -82,8 +91,19 @@ class Decipher():
         #                 for (first, rest) in splits(text, 1))
         #     return max(candidates, key=Pwords)
 
+    def _get_lang(self, text: str) -> str:
+        if bool(re.search('[А-Я]', text)):
+            return 'ru'
+        elif bool(re.search('[A-Z]', text)):
+            return 'en'
+        else:
+            raise ValueError('Язык не поддерживается')
+
     def break_in(self, cipher_text: str) -> Tuple[str, str]:
         cipher_text = self._preprocess(cipher_text)
+        if self._get_lang(cipher_text) != 'ru':
+            raise ValueError()
+        self.current_lang = 'ru'
 
         threegrams = nltk.ngrams(cipher_text, 3)
 
@@ -101,9 +121,7 @@ class Decipher():
         candidate = Counter(distance)
         candidate = candidate.most_common(int(len(candidate) * 0.1))
         
-        min_dispersion = float('inf')
-        most_expected_key = None
-        most_expected_dechipher = None
+        possible_cryptos = {}
         for expected_len, _ in candidate:
             text_split = [
                 [
@@ -117,10 +135,10 @@ class Decipher():
             for expected_split in text_split:
                 min_difference = float('inf')
                 most_expected_symbol = None
-                for key_char in self.alphabet_chars:
+                for key_char in self.alphabet_chars[self.current_lang]:
                     key_char = int(key_char)
                     translated_split = [
-                        chr(((ord(symbol) - key_char) % len(self.alphabet_chars)) + self.first_char) 
+                        chr(((ord(symbol) - key_char) % len(self.alphabet_chars[self.current_lang])) + self.first_char[self.current_lang]) 
                         for symbol in expected_split
                     ]
                     difference = self._get_prob_difference(translated_split)
@@ -129,21 +147,93 @@ class Decipher():
                         most_expected_symbol = chr(key_char)
                 key.append(most_expected_symbol)
 
-            trie_decipher = self.dechiper(cipher_text=cipher_text, key=''.join(key))
+            trie_key = ''.join(key)
+            trie_decipher = self.dechiper(cipher_text=cipher_text, key=trie_key)
+            self.current_lang = "ru"
             trie_decipher_dispersion = self._get_prob_difference(trie_decipher)
-            if trie_decipher_dispersion <= min_dispersion and (most_expected_key is None or len(key) < len(most_expected_key)):
-                min_dispersion = trie_decipher_dispersion
-                most_expected_key = key
-                most_expected_dechipher = trie_decipher
-        return (most_expected_dechipher, ''.join(most_expected_key))
+
+            if trie_decipher_dispersion in possible_cryptos:
+                possible_cryptos[trie_decipher_dispersion].append((
+                    trie_key,
+                    trie_decipher_dispersion,
+                    trie_decipher
+                ))
+            else:
+                possible_cryptos.update({trie_decipher_dispersion: [(
+                    trie_key,
+                    trie_decipher_dispersion,
+                    trie_decipher
+                )]})
+        
+        cryptos = {}
+        for crypto_group in filter(lambda e: len(e) > 1, possible_cryptos.values()):
+            minimum = (100000000000, ())
+            for candidate in crypto_group:
+                if minimum[0] > len(candidate[0]):
+                    minimum = (
+                        len(candidate[0]),
+                        candidate
+                    )
+            cryptos.update({minimum[1][1]: minimum[1]})
+
+        if len(cryptos) != 0:
+            most_expected_disperssion = min(cryptos.keys())
+            return (cryptos[most_expected_disperssion][2], cryptos[most_expected_disperssion][0], cryptos.values())
+        
+        cryptos = {}
+        for crypto_group in possible_cryptos.values():
+            minimum = (100000000000, ())
+            for candidate in crypto_group:
+                if minimum[0] > len(candidate[0]):
+                    minimum = (
+                        len(candidate[0]),
+                        candidate
+                    )
+            cryptos.update({minimum[1][1]: minimum[1]})
+        most_expected_disperssion = min(cryptos.keys())
+        return (cryptos[most_expected_disperssion][2], cryptos[most_expected_disperssion][0], cryptos.values())
+
     
     def dechiper(self, cipher_text: str, key: Optional[str]=None) -> str:
+        if self.current_lang is None:
+            cipher_text = self._preprocess(cipher_text)
+            key = self._preprocess(key)
+            key_lang = self._get_lang(''.join(key))
+            text_lang = self._get_lang(cipher_text)
+            if key_lang != text_lang:
+                raise ValueError()
+            self.current_lang = text_lang
+
         if key is None:
             key = self.key
 
         res = []
         for i, symbol in enumerate(cipher_text):
             res.append(chr(
-                ((ord(symbol) - ord(key[i % len(key)])) % 32) + self.first_char
+                ((ord(symbol) - ord(key[i % len(key)])) % len(self.alphabet_chars[self.current_lang])) + self.first_char[self.current_lang]
             ))
+        
+        self.current_lang = None
+        return ''.join(res)
+    
+    def chiper(self, cipher_text: str, key: Optional[str]=None) -> str:
+        if self.current_lang is None:
+            cipher_text = self._preprocess(cipher_text)
+            key = self._preprocess(key)
+            key_lang = self._get_lang(''.join(key))
+            text_lang = self._get_lang(cipher_text)
+            if key_lang != text_lang:
+                raise ValueError()
+            self.current_lang = self._get_lang(cipher_text)
+
+        if key is None:
+            key = self.key
+
+        res = []
+        for i, symbol in enumerate(cipher_text):
+            res.append(chr(
+                ((ord(symbol) + ord(key[i % len(key)])) % len(self.alphabet_chars[self.current_lang])) + self.first_char[self.current_lang]
+            ))
+        
+        self.current_lang = None
         return ''.join(res)
